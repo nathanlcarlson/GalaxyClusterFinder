@@ -1,10 +1,16 @@
 import sys
 
 import numpy as np
-# import scipy
+from astropy.cosmology import Planck13
+import astropy.units as AU
 import matplotlib.pyplot as plt
+import scipy.integrate as integrate
 from sklearn.mixture import GaussianMixture
+from scipy.interpolate import UnivariateSpline
+from scipy.interpolate import RectBivariateSpline
+from scipy import optimize
 
+COSMO = Planck13
 class SDSSData:
     ''' A class for managing photometric and spectroscopic data '''
 
@@ -71,6 +77,52 @@ class SDSSData:
         ''' Access a stored view '''
         return self.views[name]
 
+
+# TODO Backgroud esitmates!!
+def G(c, c_z, z, sig=0.05):
+    a = 1/(np.sqrt(2*np.pi)*sig)
+    b = -1*np.power(c - c_z(z), 2)/(2*sig*sig)
+    return a*np.exp(b)
+
+def m_star_z(z):
+
+    return 12.27 + 62.36*z - 289.79*np.power(z, 2) + 729.69*np.power(z, 3) - 709.42*np.power(z, 4)
+    # return 12.27 + 62.36*z - 289.79*z**2 + 729.69*z**3 − 709.42*z**4
+
+def phi(m, z, m_star=None, a=0.8):
+    if not m_star:
+        m_star = m_star_z(z)
+    return np.power(10, -0.4*(m-m_star)*(a+1))*np.exp(-1*np.power(10, -0.4*(m-m_star)))
+
+def sigma(R, R_s=0.15, R_core=0.1):
+    if R < R_core:
+        return sigma(R_core)
+    q = R/R_s
+    a = 1/(q*q-1)
+    if q < 1:
+        x = np.sqrt(-1*(q-1)/(q+1))
+        b = 1 - 2/np.sqrt(-1*(q*q-1))*np.arctanh(x)
+    if q >= 1:
+        x = np.sqrt((q-1)/(q+1))
+        b = 1 - 2/np.sqrt(q*q-1)*np.arctan(x)
+    return a*b
+def get_red_model(data, reds):
+
+    z = data.spec('redshift')[reds]
+    color = data.view("g-r")[reds]
+
+    z, unique_index = np.unique(z, return_index=True)
+    color = color[unique_index]
+    x = z[z.argsort()]
+    y = color[z.argsort()]
+
+    f = UnivariateSpline(x, y)
+    # xnew = np.linspace(min(x), max(x), 1000)
+    # plt.plot(x, y, 'o', xnew, f(xnew), '-')
+    # plt.legend(['data', 'linear', 'cubic'], loc='best')
+    # plt.show()
+    return f
+
 def find_red_gals(data):
     ''' Find red spectroscopic galaxies in sample data '''
     # Get color
@@ -119,12 +171,130 @@ def reds_plot(data, reds):
     plt.plot(data.spec('redshift')[reds], color[reds], 'o')
     plt.show()
 
+def background_est(data):
+
+    specgr = data.spec("g") - data.spec("r")
+    photgr = data.phot("g") - data.phot("r")
+    alli = np.concatenate((data.spec("ci"), data.phot("ci")))
+    allgr = np.concatenate((specgr, photgr))
+
+    gr_edges = np.linspace(-1, 3, 41)
+    i_edges = np.linspace(12, 22, 101)
+
+    H, xedges, yedges = np.histogram2d(alli, allgr, bins=(i_edges, gr_edges))
+    min_dec = min((min(data.spec("dec")), min(data.phot("dec"))))
+    max_dec = max((max(data.spec("dec")), max(data.phot("dec"))))
+    min_ra = min((min(data.spec("ra")), min(data.phot("ra"))))
+    max_ra = max((max(data.spec("ra")), max(data.phot("ra"))))
+    A = (max_dec-min_dec)*(max_ra-min_ra)
+    H = H/0.1/0.1/A
+    x = [(a+b)/2 for a, b in zip(xedges[:-1], xedges[1:])]
+    y = [(a+b)/2 for a, b in zip(yedges[:-1], yedges[1:])]
+    # points = np.mgrid(x, y)
+    # values = np.ravel(H)
+
+    return RectBivariateSpline(x, y, H)
+
+def density(S_R, p_m, g_c):
+
+    return S_R * p_m * g_c
+
+def distance(t1, p1, t2, p2, mpc):
+    a = 2*mpc*mpc*(1-(np.sin(t1)*np.sin(t2)*np.cos(p1-p2)+np.cos(t1)*np.cos(t2)))
+    return np.sqrt(a)
+
+def sigma_normalization(R_c=0.9):
+    p = np.log(R_c)
+    a = (
+        1.6517 - 0.5479*p +
+        0.1382*pow(p, 2) - 0.0719*pow(p, 3) -
+        0.01582*pow(p, 4) - 0.00085499*pow(p, 5)
+    )
+
+    return np.exp(a)
+
+def phi_normalization(z):
+    m_star = m_star_z(z)
+    m_lim = m_star + 1.75
+    I = integrate.quad(phi, 0, m_lim, args=(z))[0]
+    return 1/I
+
+def func(x, u, b):
+    u = x*u
+    return x - np.sum(u/(u+b))
+
 def main():
     ''' Main operations '''
     data = SDSSData(sys.argv[1], sys.argv[2])
     reds = find_red_gals(data)
+    model = get_red_model(data, reds)
 
-    reds_plot(data, reds)
+    bkg = background_est(data)
+    vsigma = np.vectorize(sigma)
+    vphi = np.vectorize(phi)
+    vG = np.vectorize(G)
+    vDist = np.vectorize(distance)
 
+    spec_color = data.spec("g") - data.spec("r")
+    phot_color = data.phot("g") - data.phot("r")
+    spec_theta = data.spec("ra")*np.pi/180
+    phot_theta = data.phot("ra")*np.pi/180
+    spec_phi = (90.0-data.spec("dec"))*np.pi/180
+    phot_phi = (90.0-data.phot("dec"))*np.pi/180
+
+    color = np.concatenate((spec_color, phot_color))
+    theta = np.concatenate((spec_theta, phot_theta))
+    phi_s = np.concatenate((spec_phi, phot_phi))
+    mags = np.concatenate((data.spec("ci"), data.phot("ci")))
+    R_0 = sigma_normalization()
+
+    print("Use seeds...")
+    for t, p, c, z in zip(spec_theta[reds], spec_phi[reds], spec_color[reds], data.spec("redshift")[reds]):
+        valids = np.zeros(len(color)).astype(bool)
+        valids[mags<21.0] = True
+        valids[(color < model(z)+2*0.05)&(color > model(z)-2*0.05)] = True
+        if not np.any(valids):
+            continue
+        mpc = float(COSMO.luminosity_distance(z)/pow((z+1), 2)/AU.Mpc)
+        Rs = vDist(t, p, theta[valids], phi_s[valids], mpc)
+        validR =  Rs < .5
+        valids[valids] = validR
+        if not np.any(valids):
+            continue
+
+        Rs = Rs[validR]
+        S_R = 2*np.pi*R_0*vsigma(Rs)
+        # print(phi_normalization(z))
+        p_m = phi_normalization(z)*vphi(mags[valids], z)
+        G_c = vG(color[valids], model, z)
+        # print("SigmaR", S_R)
+        # print("PhiM", p_m)
+        # print("Gc", G_c)
+        rho = density(S_R, p_m, G_c)
+
+        bkg_density = []
+        for i in range(len(mags[valids])):
+            bkg_density.append(bkg(mags[valids][i], color[valids][i])[0][0])
+        bkg_density = np.array(bkg_density)
+        bkg_density *= 2*np.pi*Rs
+        # print("u", rho)
+        # print("bkg", bkg_density)
+        sol = optimize.root(func, 100, args=(rho, bkg_density))
+        if sol.x > 10:
+            print("z: {:01.6f}\nlambda: {:03.4f}".format(z, sol.x[0]))
+
+
+    # rs = np.linspace(0, 1, 1000)
+    # plt.plot(rs, vsigma(rs),'o')
+    # plt.show()
+    # ms = np.linspace(14, 22, 1000)
+    # plt.plot(ms, vphi(ms, z=0.2),'o')
+    # plt.show()
+    # plt.hist(data.view("g-r")[reds])
+    # reds_plot(data, reds)
+
+    # cs = np.linspace(1.0, 2.0, 1000)
+    # plt.plot(cs, vG(cs, model, 0.2), 'o')
+    # plt.show()
 if __name__ == "__main__":
     main()
